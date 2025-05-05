@@ -1,0 +1,12 @@
+# This is an example configuration file for a sideload-only cache.
+[memory]
+# The memory cache is disabled.
+disabled = true
+
+[disk]
+# The disk cache is disabled.
+disabled = true
+
+[sideload]
+# The path to the directory where the sideloaded files are stored.
+path = "/var/lib/SomeOmneCacheApp/evidence"
