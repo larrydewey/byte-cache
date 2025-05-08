@@ -15,19 +15,12 @@ use fs2::FileExt;
 use std::{
     io::Write,
     os::unix::fs::DirBuilderExt,
-    path::{Component, Path, PathBuf},
-    sync::Arc,
+    path::{Component, PathBuf},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-use rand::{Rng, rng};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 // Constants for file operations
-const BASE_RETRY_DELAY_MS: u64 = 50;
-const MAX_RETRY_DELAY_MS: u64 = 1000; // 1 second max
-const DIR_SYNC_RETRY_COUNT: u8 = 3;
+const LOCK_RETRY_TIMEOUT: u64 = 5;
+const WRITE_LOCK_COUNT: usize = 2;
 
 /// Marker type for read-only filesystem operations.
 ///
@@ -43,8 +36,6 @@ pub struct Read(());
 pub struct ReadWrite {
     /// Maximum number of items to store in this cache
     _limit: usize,
-    /// Semaphore to control concurrent access and enforce size limits.
-    _semaphore: Arc<Semaphore>,
 }
 
 // Future work for FsCache<Key, Value, Kind = Read>:
@@ -65,40 +56,45 @@ pub struct FsCache<T> {
     _kind: T,
 }
 
+/// The UnlockGuard is used to make sure files are cleaned up if a file-handle
+/// falls out of scope for any reason.
+struct UnlockGuard<'a>(&'a std::fs::File);
+
+impl Drop for UnlockGuard<'_> {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(self.0);
+    }
+}
+
 impl<T> FsCache<T> {
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
-        // Validate key first
         if validate_key(key).await.is_err() {
             return None;
         }
 
         let file_path = self.path.join(key);
+
         if !file_path.exists() {
             return None;
         }
 
         // Use blocking task with timeout to ensure we don't block the async runtime indefinitely
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5), // 5 second timeout
+            std::time::Duration::from_secs(LOCK_RETRY_TIMEOUT), // 5 second timeout
             tokio::task::spawn_blocking(move || {
                 let file = match std::fs::File::open(&file_path) {
                     Ok(f) => f,
                     Err(_) => return None,
                 };
 
+                // Create the lock guard for the file-handle to protect
+                // against a failed lock.
+                let _ = UnlockGuard(&file);
+
                 // Use shared lock for reading to prevent reading during writes
                 if FileExt::lock_shared(&file).is_err() {
                     return None;
                 }
-
-                // Ensure lock is released with a guard pattern
-                struct UnlockGuard<'a>(&'a std::fs::File);
-                impl Drop for UnlockGuard<'_> {
-                    fn drop(&mut self) {
-                        let _ = FileExt::unlock(self.0);
-                    }
-                }
-                let _guard = UnlockGuard(&file);
 
                 std::fs::read(&file_path).ok()
             }),
@@ -128,115 +124,47 @@ impl FsCache<Read> {
     pub async fn read(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path: PathBuf = path.into();
 
-        if path.exists() {
-            let fh = std::fs::File::open(&path)?;
+        // Use blocking task with timeout to ensure we don't block the async runtime indefinitely
+        tokio::time::timeout(
+            std::time::Duration::from_secs(LOCK_RETRY_TIMEOUT),
+            tokio::task::spawn_blocking(move || {
+                if path.exists() {
+                    let fh = std::fs::File::open(&path)?;
 
-            let permission = fh.metadata()?.permissions();
+                    let _guard = UnlockGuard(&fh);
 
-            if permission.readonly() {
-                Ok(Self {
-                    path,
-                    _kind: Read(()),
-                })
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Sideload cache must have read-only permissions",
-                ))
-            }
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Path does not exist",
-            ))
-        }
+                    if FileExt::lock_shared(&fh).is_err() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ResourceBusy,
+                            "File could not obtain a lock.",
+                        ));
+                    }
+
+                    if fh.metadata()?.permissions().readonly() {
+                        Ok(Self {
+                            path,
+                            _kind: Read(()),
+                        })
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Sideload cache must have read-only permissions",
+                        ))
+                    }
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Path does not exist",
+                    ))
+                }
+            }),
+        )
+        .await??
     }
 }
 
 impl FsCache<ReadWrite> {
-    /// Removes stale temporary and lock files from the cache directory.
-    ///
-    /// This method is called during cache initialization to clean up any files
-    /// that might have been left over from interrupted operations:
-    /// - `.tmp` files are always removed as they represent incomplete writes
-    /// - `.lock` files are removed only if they're considered stale (determined by `is_lock_file_stale`)
-    ///
-    /// # Parameters
-    /// * `path`: The directory path to clean
-    ///
-    /// # Returns
-    /// * `Ok(())`: If cleanup was successful or no cleanup was needed
-    /// * `Err(std::io::Error)`: If an error occurred during the cleanup process
-    async fn cleanup_temp_files(path: &Path) -> std::io::Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-
-        let dir = match path.read_dir() {
-            Ok(dir) => dir,
-            Err(_) => return Ok(()),
-        };
-
-        for entry in dir.filter_map(Result::ok) {
-            let file_path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().to_string();
-
-            if file_name.ends_with(".tmp") {
-                // Always remove temporary files
-                if let Err(e) = std::fs::remove_file(&file_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to remove temp file: {}", e),
-                        ));
-                    }
-                }
-            } else if file_name.ends_with(".lock") {
-                // Only remove stale lock files
-                if Self::is_lock_file_stale(&file_path).await {
-                    if let Err(e) = std::fs::remove_file(&file_path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to remove stale lock file: {}", e),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Determines if a lock file is stale based on its modification time.
-    ///
-    /// Lock files are considered stale if they're older than 5 minutes,
-    /// as this suggests an interrupted or hung operation.
-    ///
-    /// # Parameters
-    /// * `lock_path`: Path to the lock file to check
-    ///
-    /// # Returns
-    /// * `true`: If the lock file is considered stale
-    /// * `false`: If the lock file is still valid or cannot be checked
-    async fn is_lock_file_stale(lock_path: &Path) -> bool {
-        match lock_path.metadata() {
-            Ok(metadata) => {
-                if let Ok(modified_time) = metadata.modified() {
-                    if let Ok(elapsed) = modified_time.elapsed() {
-                        // Consider lock files older than 5 minutes as stale
-                        return elapsed > std::time::Duration::from_secs(300);
-                    }
-                }
-                false
-            }
-            Err(_) => false,
-        }
-    }
-
     async fn create_dir(&self, permissions: u32) -> std::io::Result<()> {
-        // First check if directory exists to avoid unnecessary work
         if self.path.exists() {
             return Ok(());
         }
@@ -247,100 +175,58 @@ impl FsCache<ReadWrite> {
         tokio::task::spawn_blocking(move || {
             let lock_path = path.join(".directory.lock");
 
-            // Use a more robust locking approach with proper cleanup
-            let lock_file = match std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&lock_path)
+            let dir_lock_file = std::fs::File::open(&lock_path)?;
+
+            let _ = UnlockGuard(&dir_lock_file);
+
+            FileExt::lock_exclusive(&dir_lock_file)?;
+
+            let _ = match std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(permissions)
+                .create(&path)
             {
-                Ok(file) => file,
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to create lock file: {}", e),
-                    ));
-                }
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(e) => Err(e),
             };
 
-            // Try to acquire an exclusive lock, cleaning up properly on failure
-            if let Err(e) = lock_file.try_lock_exclusive() {
-                // Another process has the lock
-                let _ = std::fs::remove_file(&lock_path);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    format!("Directory creation in progress by another process: {}", e),
-                ));
-            }
+            FileExt::unlock(&dir_lock_file)?;
+            std::fs::remove_file(&lock_path)?;
 
-            // Use a scoped cleanup to ensure lock file is removed
-            let result = {
-                let result = std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(permissions)
-                    .create(&path);
-
-                // If creation failed because directory now exists (concurrent creation),
-                // that's still a success for our purposes
-                match result {
-                    Ok(_) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                    Err(e) => Err(e),
-                }
-            };
-
-            // Always unlock and remove the lock file
-            let _ = FileExt::unlock(&lock_file);
-            let _ = std::fs::remove_file(&lock_path);
-
-            result
+            Ok(())
         })
         .await?
     }
 
     pub async fn write(path: impl Into<PathBuf>, limit: usize) -> std::io::Result<Self> {
         let path = path.into();
-        let semaphore = Arc::new(Semaphore::new(limit));
 
         let cache = Self {
             path: path.clone(),
-            _kind: ReadWrite {
-                _limit: limit,
-                _semaphore: semaphore.clone(),
-            },
+            _kind: ReadWrite { _limit: limit },
         };
 
         if !path.exists() {
             cache.create_dir(0o700).await?;
-        } else {
-            // Clean up any orphaned temp files from previous runs
-            Self::cleanup_temp_files(&path).await?;
-
-            if limit > 0 {
-                let entries_count = path.read_dir()?.filter_map(Result::ok).count();
-                let permits = std::cmp::min(entries_count, limit) as u32;
-                if permits > 0 {
-                    if let Ok(permit) = semaphore.try_acquire_many_owned(permits) {
-                        permit.forget();
-                    }
-                }
-            }
         }
 
         Ok(cache)
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
-        // Validate key first
         validate_key(key).await?;
+
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "You cannot store a key without data.",
+            ));
+        }
 
         if !self.path.exists() {
             self.create_dir(0o700).await?;
-        } else if tokio::fs::metadata(&self.path)
-            .await?
-            .permissions()
-            .readonly()
-        {
+        } else if std::fs::metadata(&self.path)?.permissions().readonly() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ReadOnlyFilesystem,
                 "Incorrect permissions for the disk cache.",
@@ -348,304 +234,68 @@ impl FsCache<ReadWrite> {
         }
 
         let file_path = self.path.join(key);
-        let semaphore = self._kind._semaphore.clone();
-        let limit = self._kind._limit;
-
-        // Execute file IO in blocking task
         let data = data.to_vec();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
+        // Make sure limit is enforced before we create the files.
+        if tokio::fs::read_dir(&self.path).await.iter().count()
+            >= self._kind._limit - WRITE_LOCK_COUNT
+            && self.get(&key).await.is_none()
+        {
+            // If not, error out. No space left.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "Cannot exceed cache limit",
+            ));
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(LOCK_RETRY_TIMEOUT),
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 let key_lock_path = file_path.with_extension(".lock");
-                let check_path = file_path.with_extension(".tmp");
+                let tmp_path = file_path.with_extension(".tmp");
 
-                if check_path.exists() {
-                    match std::fs::symlink_metadata(&check_path) {
-                        Ok(metadata) => {
-                            if metadata.file_type().is_symlink() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "Potential symlink attack detected",
-                                ));
-                            }
-                        },
-                        Err(_) => {} // If we can't check, we'll create normally and overwrite
+                if tmp_path.exists() {
+                    let metadata = tmp_path.metadata()?;
+
+                    if metadata.is_symlink() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Potential symlink attack detected",
+                        ));
+                    }
+
+                    if metadata.permissions().readonly() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Cannot write to the path provided. Invalid permissions.",
+                        ));
                     }
                 }
 
-                struct CleanupGuard {
-                    lock_path: PathBuf,
-                    temp_path: PathBuf,
-                    permit: Option<OwnedSemaphorePermit>,
-                }
+                let key_lock_file = std::fs::File::open(&key_lock_path)?;
+                let _ = UnlockGuard(&key_lock_file);
 
-                impl Drop for CleanupGuard {
-                    fn drop(&mut self) {
-                        let _ = std::fs::remove_file(&self.lock_path);
-                        let _ = std::fs::remove_file(&self.temp_path);
-                    }
-                }
+                FileExt::lock_exclusive(&key_lock_file)?;
 
-                let mut guard = CleanupGuard {
-                    lock_path: key_lock_path.clone(),
-                    temp_path: check_path.clone(),
-                    permit: None,
-                };
+                let tmp_file = std::fs::File::open(&tmp_path)?;
+                let _ = UnlockGuard(&tmp_file);
 
-                let _ = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&key_lock_path)?;
+                FileExt::lock_exclusive(&tmp_file)?;
 
-                const MAX_RETRIES: u8 = 3;
-                const RETRY_DELAY_MS: u64 = 50;
-                let temp_path = file_path.with_extension(".tmp");
+                (move || -> std::io::Result<()> {
+                    let mut writer = std::io::BufWriter::new(&key_lock_file);
+                    writer.write_all(&data)?;
+                    writer.flush()?;
+                    key_lock_file.sync_all()?;
+                    Ok(())
+                })()?;
 
-                let need_permit = {
-                    let file_exists = std::fs::metadata(&file_path).is_ok();
-                    !file_exists && limit > 0
-                };
+                std::fs::rename(&tmp_path, &file_path)?;
 
-                let permit = if need_permit {
-                    match semaphore.try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => {
-                            std::fs::remove_file(&key_lock_path)?;
-
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::StorageFull,
-                                format!("Cannot write more than {} items", limit),
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                if !data.is_empty() {
-                    // Use statvfs to check available disk space
-                    if let Some(parent_dir) = file_path.parent() {
-                        if let Ok(stats) = nix::sys::statvfs::statvfs(
-                            parent_dir.to_str().unwrap_or(".")
-                        ) {
-                            let available_space = stats.block_size() * stats.blocks_available();
-                            let required_space = data.len() as u64 + 4096; // Data size plus some margin
-
-                            if required_space > available_space {
-                                // Clean up resources before returning
-                                if let Some(p) = permit {
-                                    p.forget();
-                                }
-                                std::fs::remove_file(&key_lock_path)?;
-
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::StorageFull,
-                                    format!("Not enough disk space: need {} bytes, have {} bytes", 
-                                        required_space, available_space),
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                for attempt in 1..=MAX_RETRIES {
-                    let result = (|| {
-                        let file = match std::fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .open(&temp_path)
-                            {
-                                Ok(file) => file,
-                                Err(e) if e.raw_os_error() == Some(24) /* EMFILE: Too many open files */ => {
-                                    // Wait briefly and retry once for this specific error
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                    std::fs::OpenOptions::new()
-                                        .write(true)
-                                        .create(true)
-                                        .truncate(true)
-                                        .open(&temp_path)?
-                                },
-                                Err(e) => return Err(e),
-                            };
-
-                        // Set the same permissions as the directory
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let mut perms = file.metadata()?.permissions();
-                            perms.set_mode(0o600); // rw for owner only
-                            file.set_permissions(perms)?;
-                        }
-
-                        // Use a scoped guard pattern for locks too
-                        if let Err(e) = file.lock_exclusive() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WouldBlock,
-                                format!("Failed to lock file: {}", e),
-                            ));
-                        }
-
-                        (|| -> std::io::Result<()> {
-                            let mut writer = std::io::BufWriter::new(&file);
-                            writer.write_all(&data)?;
-                            writer.flush()?;
-                            file.sync_all()?;
-                            Ok(())
-                        })()?;
-
-                        let unlock_result = FileExt::unlock(&file);
-
-                        if let Err(e) = unlock_result {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to unlock file: {}", e),
-                            ));
-                        }
-
-                        file.sync_all()?;
-
-                        // Cross-platform file integrity verification
-                        let written_data = std::fs::read(&temp_path)?;
-                        if written_data.len() != data.len() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Data length mismatch after write",
-                            ));
-                        }
-
-                        // Verify content hash for data integrity
-                        let mut original_hasher = DefaultHasher::new();
-                        data.hash(&mut original_hasher);
-                        let original_hash = original_hasher.finish();
-
-                        let mut written_hasher = DefaultHasher::new();
-                        written_data.hash(&mut written_hasher);
-                        let written_hash = written_hasher.finish();
-
-                        if original_hash != written_hash {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Data integrity check failed after write",
-                            ));
-                        }
-
-                        match std::fs::rename(&temp_path, &file_path) {
-                            Ok(_) => {},
-                            Err(e) if e.raw_os_error() == Some(18) /* EXDEV: Cross-device link */ => {
-                                // Fallback to copy + unlink for cross-filesystem moves
-                                std::fs::copy(&temp_path, &file_path)?;
-                                std::fs::remove_file(&temp_path)?;
-                            },
-                            Err(e) => return Err(e),
-                        }
-
-                        // Sync parent directory with exponential backoff for better reliability
-                        if let Some(parent_dir) = file_path.parent() {
-                            // Calculate backoff with jitter function for retries
-                            let calc_backoff_ms = |attempt: u8| -> u64 {
-                                let exp_factor = 2_u64.pow(attempt as u32);
-                                let base = BASE_RETRY_DELAY_MS * exp_factor;
-                                let max = MAX_RETRY_DELAY_MS;
-
-                                let backoff = std::cmp::min(base, max);
-
-                                // Add jitter (±25%)
-                                let mut rng = rng();
-                                let jitter_factor = 0.75 + (rng.random::<f64>() * 0.5); // 0.75-1.25
-                                (backoff as f64 * jitter_factor) as u64
-                            };
-
-                            // Try to sync directory multiple times with backoff
-                            let mut success = false;
-                            for attempt in 1..=DIR_SYNC_RETRY_COUNT {
-                                if let Ok(dir) = std::fs::File::open(parent_dir) {
-                                    if dir.sync_all().is_ok() {
-                                        success = true;
-                                        break;
-                                    }
-                                }
-
-                                if attempt < DIR_SYNC_RETRY_COUNT {
-                                    let delay_ms = calc_backoff_ms(attempt);
-                                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                                }
-                            }
-
-                            if !success {
-                                // Log warning but don't fail the operation
-                                // Directory sync is a best-effort operation
-                                eprintln!("Warning: Could not sync parent directory for {}", file_path.display());
-                            }
-                        }
-
-                        Ok(())
-                    })();
-
-                    if result.is_ok() {
-                        guard.permit = permit;
-                        std::mem::forget(guard);
-                        std::fs::remove_file(&key_lock_path)?;
-
-                        return Ok(());
-                    }
-
-                    if let Err(e) = &result {
-                        match e.kind() {
-                            std::io::ErrorKind::PermissionDenied |
-                            std::io::ErrorKind::NotFound |
-                            std::io::ErrorKind::InvalidInput |
-                            std::io::ErrorKind::AlreadyExists => {
-                                // Don't retry on permanent errors
-                                std::fs::remove_file(&key_lock_path)?;
-                                if let Some(p) = permit {
-                                    p.forget();
-                                }
-                                return result;
-                            },
-                            _ => {}
-                        }
-                    }
-
-                    if attempt == MAX_RETRIES {
-                        let _ = std::fs::remove_file(&temp_path);
-
-                        if result.is_err() {
-                            if let Some(p) = permit {
-                                p.forget();
-                            }
-                        }
-
-                        std::fs::remove_file(&key_lock_path)?;
-
-                        return result;
-                    }
-
-                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
-                }
-
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to write to file",
-                ))
+                Ok(())
             }),
         )
-        .await;
-
-        match result {
-            Ok(spawn_result) => match spawn_result {
-                Ok(io_result) => io_result,
-                Err(join_error) => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Task join error: {}", join_error),
-                )),
-            },
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "File operation timed out",
-            )),
-        }
+        .await??
     }
 }
 
@@ -692,20 +342,6 @@ async fn validate_key(key: &str) -> std::io::Result<()> {
                 ));
             }
         }
-    }
-
-    if key.contains('/') || key.contains('\0') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Invalid characters in cache key",
-        ));
-    }
-
-    if key.starts_with('.') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Cache key cannot start with dot",
-        ));
     }
 
     Ok(())
