@@ -1,0 +1,17 @@
+# This is an example configuration file for a disk-only cache.
+
+[memory]
+# The memory cache is disabled.
+disabled = true
+
+[disk]
+
+# The path to the cache directory
+path = "/var/cache/SomeOmneCacheApp/evidence"
+
+# The maximum number of items to store in the cache
+items = 1000
+
+[sideload]
+# The sideload cache is disabled.
+disabled = true

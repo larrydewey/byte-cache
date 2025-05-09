@@ -1,0 +1,12 @@
+# This is a memory-only cache configuration.
+[memory]
+# The maximum number of items to store in the cache.
+items = 100
+
+[disk]
+# the disk cache is disabled.
+disabled = true
+
+[sideload]
+# the sideload cache is disabled.
+disabled = true
