@@ -1,0 +1,10 @@
+# This is an example configuration file with everything enabled.
+[memory]
+items = 2000
+
+[disk]
+path = "/var/cache/SomeOmneCacheApp/evidence"
+items = 10000
+
+[sideload]
+path = "/var/lib/SomeOmneCacheApp/evidence"
